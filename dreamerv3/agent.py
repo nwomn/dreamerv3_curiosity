@@ -40,13 +40,13 @@ class Agent(embodied.jax.Agent):
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
     self.enc = {
         'simple': rssm.Encoder,
-    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
+    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc') # 这里通过self.enc调用rssm.Encoder的__init__方法
     self.dyn = {
         'rssm': rssm.RSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
+    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn') # 这里通过self.dyn调用rssm.RSSM的__init__方法
     self.dec = {
         'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
+    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec') # 这里通过self.dec调用rssm.Decoder的__init__方法
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
@@ -75,7 +75,7 @@ class Agent(embodied.jax.Agent):
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
-        name='opt')
+        name='opt') # 这里通过self.opt调用embodied.jax.Optimizer的__init__方法
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
@@ -112,16 +112,16 @@ class Agent(embodied.jax.Agent):
   def init_report(self, batch_size):
     return self.init_policy(batch_size)
 
-  def policy(self, carry, obs, mode='train'):
+  def policy(self, carry, obs, mode='train'): # 这个函数的目的是根据输入的obs和carry，输出act和out
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True)
     reset = obs['is_first']
-    enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
+    enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw) # 这里通过self.enc调用rssm.Encoder的__call__方法
     dyn_carry, dyn_entry, feat = self.dyn.observe(
-        dyn_carry, tokens, prevact, reset, **kw)
+        dyn_carry, tokens, prevact, reset, **kw) # 这里通过self.dyn调用rssm.RSSM的observe方法
     dec_entry = {}
     if dec_carry:
-      dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
+      dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
     policy = self.pol(self.feat2tensor(feat), bdims=1)
     act = sample(policy)
     out = {}
@@ -137,7 +137,7 @@ class Agent(embodied.jax.Agent):
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
     metrics, (carry, entries, outs, mets) = self.opt(
-        self.loss, carry, obs, prevact, training=True, has_aux=True)
+        self.loss, carry, obs, prevact, training=True, has_aux=True) # 这里通过embodied.jax.Optimizer调用了Agent的loss方法
     metrics.update(mets)
     self.slowval.update()
     outs = {}
@@ -153,7 +153,7 @@ class Agent(embodied.jax.Agent):
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
-  def loss(self, carry, obs, prevact, training):
+  def loss(self, carry, obs, prevact, training): # 这个函数的目的是根据输入的obs和carry，输出loss和metrics
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
     B, T = reset.shape

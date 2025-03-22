@@ -93,13 +93,13 @@ class RSSM(nj.Module):
 
   def imagine(self, carry, policy, length, training, single=False):
     if single:
-      action = policy(sg(carry)) if callable(policy) else policy
-      actemb = nn.DictConcat(self.act_space, 1)(action)
-      deter = self._core(carry['deter'], carry['stoch'], actemb)
-      logit = self._prior(deter)
-      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-      carry = nn.cast(dict(deter=deter, stoch=stoch))
-      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
+      action = policy(sg(carry)) if callable(policy) else policy # a_t
+      actemb = nn.DictConcat(self.act_space, 1)(action) # e_t
+      deter = self._core(carry['deter'], carry['stoch'], actemb) # h_{t+1}
+      logit = self._prior(deter) # log p(z_{t+1} | h_{t+1})
+      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed())) # z_{t+1} ~ p(z_{t+1} | h_{t+1})
+      carry = nn.cast(dict(deter=deter, stoch=stoch)) # h_{t+1}, z_{t+1}
+      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit)) # h_{t+1}, z_{t+1}, log p(z_{t+1} | h_{t+1})
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
@@ -119,20 +119,20 @@ class RSSM(nj.Module):
 
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
-    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
+    carry, entries, feat = self.observe(carry, tokens, acts, reset, training) # h_t, z_t, a_t
     prior = self._prior(feat['deter'])
     post = feat['logit']
-    dyn = self._dist(sg(post)).kl(self._dist(prior))
+    dyn = self._dist(sg(post)).kl(self._dist(prior)) # KL(q(z_{t+1} | h_{t+1}) || p(z_{t+1} | h_{t+1}))
     rep = self._dist(post).kl(self._dist(sg(prior)))
     if self.free_nats:
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
     losses = {'dyn': dyn, 'rep': rep}
-    metrics['dyn_ent'] = self._dist(prior).entropy().mean()
-    metrics['rep_ent'] = self._dist(post).entropy().mean()
+    metrics['dyn_ent'] = self._dist(prior).entropy().mean() # H(p(z_{t+1} | h_{t+1}))
+    metrics['rep_ent'] = self._dist(post).entropy().mean() # H(q(z_{t+1} | h_{t+1}))
     return carry, entries, losses, feat, metrics
 
-  def _core(self, deter, stoch, action):
+  def _core(self, deter, stoch, action): # deter = h_t, stoch = z_t, action = a_t
     stoch = stoch.reshape((stoch.shape[0], -1))
     action /= sg(jnp.maximum(1, jnp.abs(action)))
     g = self.blocks
@@ -156,25 +156,30 @@ class RSSM(nj.Module):
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
     deter = update * cand + (1 - update) * deter
-    return deter
+    return deter # h_{t+1} = f_φ(h_t, z_t, a_t)
 
-  def _prior(self, feat):
+  def _prior(self, feat): # feat = h_{t+1} = _core(h_t, z_t, a_t)
     x = feat
     for i in range(self.imglayers):
       x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
-    return self._logit('priorlogit', x)
+    return self._logit('priorlogit', x) # log p(z_{t+1} | h_{t+1})
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
-    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
+    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x) # 这里sub的意思是生成模型输出的原始分数和重塑形状
     return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
 
-  def _dist(self, logits):
+  def _dist(self, logits): 
+    """
+    _dist 函数是一个辅助方法，用于将logits转换为具体的概率分布对象（如分类分布或高斯分布）：
+    输入：logits，shape = [batch_size, stoch, classes]，是生成模型输出的未归一化概率分数
+    输出：返回一个分布对象，该对象具有以下方法：
+    - sample(seed)：从分布中采样一个样本，seed是随机数种子
+    """
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
-
 
 class Encoder(nj.Module):
 
