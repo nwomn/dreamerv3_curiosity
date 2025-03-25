@@ -180,7 +180,32 @@ class RSSM(nj.Module):
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
-
+  
+  def compute_uncertainty(self, prev_h, prev_z, prev_act):
+    """
+    计算预测分布的不确定性（熵），作为好奇心触发依据。
+    """
+    prev_act = nn.DictConcat(self.act_space, 1)(prev_act)
+    h = self._core(prev_h, prev_z, prev_act)
+    logit = self._prior(h)
+    entropy = self._dist(logit).entropy().mean()
+    return entropy
+  
+  def total_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
+    """
+    计算所有候选动作下预测熵的总和。
+    """
+    entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
+    return sum(entropies), entropies
+  
+  def find_action_with_max_entropy(self, prev_h, prev_z, all_actions):
+    """
+    找出使预测分布熵最大的动作。
+    """
+    entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
+    idx = jnp.argmax(jnp.array(entropies))
+    return all_actions[idx], entropies[idx]
+  
 class Encoder(nj.Module):
 
   units: int = 1024

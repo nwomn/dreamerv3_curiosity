@@ -116,23 +116,57 @@ class Agent(embodied.jax.Agent):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True)
     reset = obs['is_first']
+
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw) # 这里通过self.enc调用rssm.Encoder的__call__方法
+
     dyn_carry, dyn_entry, feat = self.dyn.observe(
         dyn_carry, tokens, prevact, reset, **kw) # 这里通过self.dyn调用rssm.RSSM的observe方法
     dec_entry = {}
+
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
+    
     policy = self.pol(self.feat2tensor(feat), bdims=1)
-    act = sample(policy)
+    act = self.curiosity_sample(policy)
+
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
+    
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
+  
+  def curiosity_sample(self, policy):
+    """
+    从动作空间中采样curiosity_samples个动作，根据每个动作对应的熵值大小构造一个概率分布，熵值越大被选中的概率越大，返回被采样到的动作
+    """
+    if self.config.curiosity_enabled:
+      rng = jax.random.PRNGKey(0)
+      actions = []
+
+      for i in range(self.config.curiosity_samples):
+        subkey = jax.random.fold_in(rng, i)
+        act = {}
+        for name, space in self.act_space.items():
+          if space.discrete:
+              val = jax.random.randint(
+                  subkey, shape=space.shape,
+                  minval=space.low, maxval=space.high + 1
+              )
+          else:
+              val = jax.random.uniform(
+                  subkey, shape=space.shape,
+                  minval=space.low, maxval=space.high
+              )
+          act[name] = val
+      actions.append(act)
+    else:
+      action = sample(policy)
+      return action
 
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)

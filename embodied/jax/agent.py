@@ -63,6 +63,12 @@ class Agent(embodied.Agent):
     [elements.print(f'  {k:<16} {v}') for k, v in obs_space.items()]
     elements.print('Actions', color='cyan')
     [elements.print(f'  {k:<16} {v}') for k, v in act_space.items()]
+
+    elements.print('Action space if discrete:')
+    [elements.print(f'  {k:<16} {v.discrete}') for k, v in act_space.items()]
+    elements.print('Action space shape:')
+    [elements.print(f'  {k:<16} {v.shape}') for k, v in act_space.items()]
+    
     elements.print('Extras', color='cyan')
     [elements.print(f'  {k:<16} {v}') for k, v in ext_space.items()]
     self.spaces = dict(**obs_space, **act_space, **ext_space)
