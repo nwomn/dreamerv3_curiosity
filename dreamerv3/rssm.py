@@ -60,6 +60,7 @@ class RSSM(nj.Module):
 
   def observe(self, carry, tokens, action, reset, training, single=False):
     carry, tokens, action = nn.cast((carry, tokens, action))
+    # [elements.print(f'{k:<16} {v.shape}') for k, v in action.items()]
     if single:
       carry, (entry, feat) = self._observe(
           carry, tokens, action, reset, training)
@@ -144,6 +145,11 @@ class RSSM(nj.Module):
     x1 = nn.act(self.act)(self.sub('dynin1norm', nn.Norm, self.norm)(x1))
     x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
     x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
+
+    # elements.print(f" x0 (from deter)  shape: {x0.shape}")
+    # elements.print(f" x1 (from stoch)  shape: {x1.shape}")
+    # elements.print(f" x2 (from action) shape: {x2.shape}")
+
     x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
     for i in range(self.dynlayers):
@@ -191,12 +197,12 @@ class RSSM(nj.Module):
     entropy = self._dist(logit).entropy().mean()
     return entropy
   
-  def total_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
+  def mean_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
     """
     计算所有候选动作下预测熵的总和。
     """
     entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
-    return sum(entropies), entropies
+    return sum(entropies)/len(entropies)
   
   def find_action_with_max_entropy(self, prev_h, prev_z, all_actions):
     """

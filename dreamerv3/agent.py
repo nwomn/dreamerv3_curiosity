@@ -126,8 +126,17 @@ class Agent(embodied.jax.Agent):
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
     
-    policy = self.pol(self.feat2tensor(feat), bdims=1)
-    act = self.curiosity_sample(policy)
+    # 好奇心机制
+    curiosity_trigger = CuriosityTrigger()
+    mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], self.sample_uniform_actions())
+    curiosity_trigger.update(mean_entropy)
+    explore, threshold = curiosity_trigger.should_explore(mean_entropy)
+    if self.config.curiosity_enabled and explore:
+      act = self.curiosity_sample()
+    else:
+      policy = self.pol(self.feat2tensor(feat), bdims=1)
+      act = sample(policy)
+    # 好奇心机制结束
 
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
@@ -137,36 +146,40 @@ class Agent(embodied.jax.Agent):
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
-          enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
+        enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
   
-  def curiosity_sample(self, policy):
+  def curiosity_sample(self, prev_h, prev_z):
     """
-    从动作空间中采样curiosity_samples个动作，根据每个动作对应的熵值大小构造一个概率分布，熵值越大被选中的概率越大，返回被采样到的动作
+    从动作空间中采样curiosity_samples个动作，根据每个动作对应的熵值大小构造一个数组，返回熵值最大的动作
     """
-    if self.config.curiosity_enabled:
-      rng = jax.random.PRNGKey(0)
-      actions = []
+    actions = self.sample_uniform_actions()
+    action = self.dyn.find_action_with_max_entropy(prev_h, prev_z, actions)
+    return action
 
-      for i in range(self.config.curiosity_samples):
-        subkey = jax.random.fold_in(rng, i)
-        act = {}
-        for name, space in self.act_space.items():
-          if space.discrete:
-              val = jax.random.randint(
-                  subkey, shape=space.shape,
-                  minval=space.low, maxval=space.high + 1
-              )
-          else:
-              val = jax.random.uniform(
-                  subkey, shape=space.shape,
-                  minval=space.low, maxval=space.high
-              )
-          act[name] = val
-      actions.append(act)
-    else:
-      action = sample(policy)
-      return action
+  def sample_uniform_actions(self):
+    rng = jax.random.PRNGKey(0)
+    actions = []
+
+    for i in range(self.config.curiosity_samples):
+      subkey = jax.random.fold_in(rng, i)
+      act = {}
+      for name, space in self.act_space.items():
+        if space.discrete:
+          val = jax.random.randint(
+            subkey, shape=(self.config.batch_size,) + space.shape,
+            minval=space.low, 
+            maxval=space.high + 1
+          )
+        else:
+          val = jax.random.uniform(
+            subkey, shape=(self.config.batch_size,) + space.shape,
+            minval=space.low, 
+            maxval=space.high
+          )
+        act[name] = val
+    actions.append(act)
+    return actions
 
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
@@ -522,3 +535,20 @@ def lambda_return(last, term, rew, val, boot, disc, lam):
   for t in reversed(range(live.shape[1])):
     rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
   return jnp.stack(list(reversed(rets))[:-1], 1)
+
+class CuriosityTrigger:
+  def __init__(self, alpha=0.01):
+    self.mean = 0.0
+    self.var = 1.0
+    self.alpha = alpha
+
+  def update(self, entropy):
+    delta = entropy - self.mean
+    self.mean += self.alpha * delta
+    self.var = (1 - self.alpha) * self.var + self.alpha * (delta ** 2)
+    return self.mean, jnp.sqrt(self.var)
+
+  def should_explore(self, entropy, std_scale=1.5):
+    mean, std = self.mean, jnp.sqrt(self.var)
+    threshold = mean + std_scale * std
+    return entropy > threshold, threshold
