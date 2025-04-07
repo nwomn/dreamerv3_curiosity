@@ -197,12 +197,12 @@ class RSSM(nj.Module):
     entropy = self._dist(logit).entropy().mean()
     return entropy
   
-  def mean_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
-    """
-    计算所有候选动作下预测熵的总和。
-    """
-    entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
-    return sum(entropies)/len(entropies)
+  # def mean_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
+  #   """
+  #   计算所有候选动作下预测熵的总和。
+  #   """
+  #   entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
+  #   return sum(entropies)/len(entropies)
   
   def find_action_with_max_entropy(self, prev_h, prev_z, all_actions):
     """
@@ -218,6 +218,10 @@ class RSSM(nj.Module):
     selected_action = jax.tree_util.tree_map(lambda x: x[idx], stacked_actions)
 
     return selected_action
+
+  def total_uncertainty_over_actions(self, deter, stoch, all_actions):
+    entropies = [self.compute_uncertainty(deter, stoch, a) for a in all_actions]
+    return sum(entropies), entropies
   
 class Encoder(nj.Module):
 

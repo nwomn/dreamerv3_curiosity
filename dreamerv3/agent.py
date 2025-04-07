@@ -127,33 +127,58 @@ class Agent(embodied.jax.Agent):
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
     
     # 好奇心机制
-    curiosity_trigger = CuriosityTrigger(self.config.curiosity_alpha, self.config.curiosity_std_scale)
-    mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], self.sample_uniform_actions())
-    curiosity_trigger.update(mean_entropy)
-    explore, threshold = curiosity_trigger.should_explore(mean_entropy)
+    # Method 1
+    # policy = self.pol(self.feat2tensor(feat), bdims=1)
 
-    policy = self.pol(self.feat2tensor(feat), bdims=1)
+    # def do_explore(_):
+    #   elements.print("do_explore output:", self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch']))
+    #   return self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch'])
 
-    def do_explore(_):
-      elements.print("do_explore output:", self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch']))
-      return self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch'])
+    # def no_explore(_):
+    #   elements.print("no_explore output:", sample(policy))
+    #   return sample(policy)
 
-    def no_explore(_):
-      elements.print("no_explore output:", sample(policy))
-      return sample(policy)
+    # act = jax.lax.cond(
+    #     self.config.curiosity_enabled,
+    #     lambda _: jax.lax.cond(explore, do_explore, no_explore, operand=None),
+    #     lambda _: no_explore(None),
+    #     operand=None
+    # )
 
-    act = jax.lax.cond(
-        self.config.curiosity_enabled,
-        lambda _: jax.lax.cond(explore, do_explore, no_explore, operand=None),
-        lambda _: no_explore(None),
-        operand=None
-    )
+    # Method 2
+    # curiosity_trigger = CuriosityTrigger(self.config.curiosity_alpha, self.config.curiosity_std_scale)
+    # mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], self.sample_uniform_actions())
+    # curiosity_trigger.update(mean_entropy)
+    # explore, threshold = curiosity_trigger.should_explore(mean_entropy)
 
     # if self.config.curiosity_enabled and explore:
     #   act = self.curiosity_sample()
     # else:
     #   policy = self.pol(self.feat2tensor(feat), bdims=1)
     #   act = sample(policy)
+
+    # Method 3
+    def sample_action():
+      return sample(self.pol(self.feat2tensor(feat), bdims=1))
+
+    all_actions = [sample_action() for _ in range(self.config.curiosity_samples)]
+
+    total_entropy, entropies = self.dyn.total_uncertainty_over_actions(
+      dyn_carry['deter'], dyn_carry['stoch'], all_actions)
+
+    # entropy_values = jnp.array(entropies)
+    # adaptive_thresh = entropy_values.mean() + self.config.curiosity_thresh_alpha * entropy_values.std()
+    # curiosity_trigger = self.config.curiosity_enabled and (total_entropy > adaptive_thresh)
+    curiosity_trigger = self.config.curiosity_enabled and (total_entropy > self.config.curiosity_thresh)
+    
+    policy = self.pol(self.feat2tensor(feat), bdims=1)
+    act = jax.lax.cond(
+      curiosity_trigger,
+      lambda _: self.dyn.find_action_with_max_entropy(
+        dyn_carry['deter'], dyn_carry['stoch'], all_actions),
+      lambda _: sample(policy),
+      operand=None
+    )
     # 好奇心机制结束
 
     out = {}
