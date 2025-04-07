@@ -127,15 +127,33 @@ class Agent(embodied.jax.Agent):
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
     
     # 好奇心机制
-    curiosity_trigger = CuriosityTrigger()
+    curiosity_trigger = CuriosityTrigger(self.config.curiosity_alpha, self.config.curiosity_std_scale)
     mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], self.sample_uniform_actions())
     curiosity_trigger.update(mean_entropy)
     explore, threshold = curiosity_trigger.should_explore(mean_entropy)
-    if self.config.curiosity_enabled and explore:
-      act = self.curiosity_sample()
-    else:
-      policy = self.pol(self.feat2tensor(feat), bdims=1)
-      act = sample(policy)
+
+    policy = self.pol(self.feat2tensor(feat), bdims=1)
+
+    def do_explore(_):
+      elements.print("do_explore output:", self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch']))
+      return self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch'])
+
+    def no_explore(_):
+      elements.print("no_explore output:", sample(policy))
+      return sample(policy)
+
+    act = jax.lax.cond(
+        self.config.curiosity_enabled,
+        lambda _: jax.lax.cond(explore, do_explore, no_explore, operand=None),
+        lambda _: no_explore(None),
+        operand=None
+    )
+
+    # if self.config.curiosity_enabled and explore:
+    #   act = self.curiosity_sample()
+    # else:
+    #   policy = self.pol(self.feat2tensor(feat), bdims=1)
+    #   act = sample(policy)
     # 好奇心机制结束
 
     out = {}
@@ -169,7 +187,7 @@ class Agent(embodied.jax.Agent):
           val = jax.random.randint(
             subkey, shape=(self.config.batch_size,) + space.shape,
             minval=space.low, 
-            maxval=space.high + 1
+            maxval=space.high
           )
         else:
           val = jax.random.uniform(
@@ -537,10 +555,11 @@ def lambda_return(last, term, rew, val, boot, disc, lam):
   return jnp.stack(list(reversed(rets))[:-1], 1)
 
 class CuriosityTrigger:
-  def __init__(self, alpha=0.01):
+  def __init__(self, alpha, std_scale):
     self.mean = 0.0
     self.var = 1.0
     self.alpha = alpha
+    self.std_scale = std_scale
 
   def update(self, entropy):
     delta = entropy - self.mean
@@ -548,7 +567,7 @@ class CuriosityTrigger:
     self.var = (1 - self.alpha) * self.var + self.alpha * (delta ** 2)
     return self.mean, jnp.sqrt(self.var)
 
-  def should_explore(self, entropy, std_scale=1.5):
+  def should_explore(self, entropy):
     mean, std = self.mean, jnp.sqrt(self.var)
-    threshold = mean + std_scale * std
+    threshold = mean + self.std_scale * std
     return entropy > threshold, threshold

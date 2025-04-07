@@ -116,8 +116,10 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
-    curiosity_enabled: False
+    curiosity_enabled: True  # 是否启用好奇心机制
     curiosity_samples: 10        # 每次用于评估的不确定性动作采样数量
+    curiosity_alpha: 0.01          # 好奇心机制阈值对新值的敏感程度
+    curiosity_std_scale: 1.5        # 好奇心机制标准差正常波动范围
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}

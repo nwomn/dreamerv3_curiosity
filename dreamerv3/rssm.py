@@ -208,9 +208,16 @@ class RSSM(nj.Module):
     """
     找出使预测分布熵最大的动作。
     """
-    entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
-    idx = jnp.argmax(jnp.array(entropies))
-    return all_actions[idx], entropies[idx]
+    entropies = jnp.array([
+        self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions
+    ])
+    idx = jnp.argmax(entropies)
+
+    # ❗ all_actions 要变成 JAX 能处理的结构（dict of arrays）
+    stacked_actions = jax.tree_util.tree_map(lambda *x: jnp.stack(x), *all_actions)
+    selected_action = jax.tree_util.tree_map(lambda x: x[idx], stacked_actions)
+
+    return selected_action
   
 class Encoder(nj.Module):
 
