@@ -197,12 +197,12 @@ class RSSM(nj.Module):
     entropy = self._dist(logit).entropy().mean()
     return entropy
   
-  # def mean_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
-  #   """
-  #   计算所有候选动作下预测熵的总和。
-  #   """
-  #   entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
-  #   return sum(entropies)/len(entropies)
+  def mean_uncertainty_over_actions(self, prev_h, prev_z, all_actions):
+    """
+    计算所有候选动作下预测熵的总和。
+    """
+    entropies = [self.compute_uncertainty(prev_h, prev_z, a) for a in all_actions]
+    return sum(entropies)/len(entropies)
   
   def find_action_with_max_entropy(self, prev_h, prev_z, all_actions):
     """
