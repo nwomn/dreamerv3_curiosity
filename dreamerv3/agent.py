@@ -158,9 +158,6 @@ class Agent(embodied.jax.Agent):
 
     all_actions = [sample_action() for _ in range(self.config.curiosity_samples)]
 
-    total_entropy, entropies = self.dyn.total_uncertainty_over_actions(
-      dyn_carry['deter'], dyn_carry['stoch'], all_actions)
-
     curiosity_trigger = CuriosityTrigger(self.config.curiosity_alpha, self.config.curiosity_std_scale)
     mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], all_actions)
     curiosity_trigger.update(mean_entropy)

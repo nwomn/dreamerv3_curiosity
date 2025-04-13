@@ -118,10 +118,9 @@ defaults:
     report_gradnorms: False
     curiosity_enabled: True  # 是否启用好奇心机制
     curiosity_samples: 10        # 每次用于评估的不确定性动作采样数量
-    curiosity_alpha: 0.01          # 好奇心机制阈值对新值的敏感程度
-    curiosity_std_scale: 1.5        # 好奇心机制标准差正常波动范围
+    curiosity_alpha: 0.001          # 动态好奇心机制阈值对新值的敏感程度
+    curiosity_std_scale: 1        # 动态好奇心机制标准差正常波动范围
     curiosity_thresh: 25         # 好奇心机制阈值
-    curiosity_thresh_alpha: 1.0  # 用于计算 mean + alpha * std 的自适应阈值
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
