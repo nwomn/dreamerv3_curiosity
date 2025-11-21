@@ -116,11 +116,13 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
-    curiosity_enabled: True  # 是否启用好奇心机制
-    curiosity_samples: 10        # 每次用于评估的不确定性动作采样数量
-    curiosity_alpha: 0.001          # 动态好奇心机制阈值对新值的敏感程度
-    curiosity_std_scale: 1        # 动态好奇心机制标准差正常波动范围
-    curiosity_thresh: 25         # 好奇心机制阈值
+
+    # Curiosity-driven exploration configuration
+    curiosity:
+      enabled: True              # Global toggle for curiosity mechanism
+      samples: 10                # Number of actions to sample for uncertainty evaluation
+      alpha: 0.001              # EMA smoothing factor for dynamic threshold
+      std_scale: 1.0            # Standard deviation multiplier for threshold calculation
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
@@ -159,46 +161,73 @@ size400m: &size400m
 
 minecraft:
   task: minecraft_diamond
+  agent.curiosity:
+    enabled: True
+    std_scale: 1.5      # Long-term sparse reward, moderate exploration
 
 dmlab:
   task: dmlab_explore_goal_locations_small
   run: {steps: 2.6e7, train_ratio: 32}
+  agent.curiosity:
+    enabled: True
+    std_scale: 2.0      # Navigation tasks benefit from aggressive exploration
+    samples: 15         # More samples for complex 3D environments
 
 atari:
   task: atari_pong
   run: {steps: 5.1e7, train_ratio: 32}
+  agent.curiosity:
+    enabled: True
+    std_scale: 1.5      # Balanced exploration for Atari games
 
 procgen:
   task: procgen_coinrun
   run: {steps: 1.1e8, train_ratio: 64}
+  agent.curiosity:
+    enabled: True
+    std_scale: 1.3      # Procedural generation requires adaptive exploration
 
 atari100k:
   task: atari100k_pong
   run: {steps: 1.1e5, envs: 1, train_ratio: 256}
+  agent.curiosity:
+    enabled: True
+    samples: 5          # Reduced samples for data efficiency
+    std_scale: 1.2
 
 crafter:
   task: crafter_reward
   run: {steps: 1.1e6, envs: 1, train_ratio: 512}
+  agent.curiosity:
+    enabled: True
+    std_scale: 1.2      # Open-world exploration
+    alpha: 0.0005       # Slower adaptation for long-term exploration
 
 dmc_proprio:
   <<: *size1m
   task: dmc_walker_walk
   env.dmc.image: False
   run: {steps: 1.1e6, train_ratio: 1024}
+  agent.curiosity.enabled: False  # Dense reward, no curiosity needed
 
 dmc_vision:
   task: dmc_walker_walk
   env.dmc.proprio: False
   run: {steps: 1.1e6, train_ratio: 256}
+  agent.curiosity.enabled: False  # Continuous control, dense reward
 
 bsuite:
   task: bsuite_mnist/0
   run: {envs: 1, save_every: -1, train_ratio: 1024}
+  agent.curiosity.enabled: False  # Behavioral suite tests
 
 loconav:
   task: loconav_ant_maze_m
   env.loconav.repeat: 1
   run.train_ratio: 256
+  agent.curiosity:
+    enabled: True
+    std_scale: 1.5      # Navigation tasks benefit from exploration
 
 multicpu:
   batch_size: 12

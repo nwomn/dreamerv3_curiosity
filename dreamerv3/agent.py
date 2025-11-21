@@ -72,10 +72,10 @@ class Agent(embodied.jax.Agent):
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     # Initialize curiosity trigger for exploration
-    if config.curiosity_enabled:
+    if config.curiosity.enabled:
       self.curiosity_trigger = CuriosityTrigger(
-          config.curiosity_alpha,
-          config.curiosity_std_scale)
+          config.curiosity.alpha,
+          config.curiosity.std_scale)
     else:
       self.curiosity_trigger = None
 
@@ -110,7 +110,7 @@ class Agent(embodied.jax.Agent):
     zeros = lambda x: jnp.zeros((batch_size, *x.shape), x.dtype)
     curiosity_state = (
         self.curiosity_trigger.initial_state()
-        if self.config.curiosity_enabled
+        if self.config.curiosity.enabled
         else None
     )
     return (
@@ -140,57 +140,10 @@ class Agent(embodied.jax.Agent):
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw) # 这里通过self.dec调用rssm.Decoder的__call__方法
 
-    # 好奇心机制
-    # Method 1 -
-    # curiosity_trigger = CuriosityTrigger(self.config.curiosity_alpha, self.config.curiosity_std_scale)
-    # mean_entropy = self.dyn.mean_uncertainty_over_actions(dyn_carry['deter'], dyn_carry['stoch'], self.sample_uniform_actions())
-    # elements.print("mean_entropy:", mean_entropy)
-    # curiosity_trigger.update(mean_entropy)
-    # explore, threshold = curiosity_trigger.should_explore(mean_entropy)
-    # elements.print("threshold:", threshold)
-
-    # def do_explore(_):
-    #   # elements.print("do_explore output:", self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch']))
-    #   return self.curiosity_sample(dyn_carry['deter'], dyn_carry['stoch'])
-
-    # def no_explore(_):
-    #   # elements.print("no_explore output:", sample(self.pol(self.feat2tensor(feat), bdims=1)))
-    #   return sample(self.pol(self.feat2tensor(feat), bdims=1))
-
-    # act = jax.lax.cond(
-    #     self.config.curiosity_enabled,
-    #     lambda _: jax.lax.cond(explore, do_explore, no_explore, operand=None),
-    #     lambda _: no_explore(None),
-    #     operand=None
-    # )
-
-    # Method 2 - Using stateless curiosity trigger
+    # Select action with optional curiosity-driven exploration
     policy = self.pol(self.feat2tensor(feat), bdims=1)
-
-    def sample_action():
-      return sample(policy)
-
-    all_actions = [sample_action() for _ in range(self.config.curiosity_samples)]
-
-    # Use stateless curiosity trigger
-    if self.config.curiosity_enabled and curiosity_state is not None:
-      mean_entropy = self.dyn.mean_uncertainty_over_actions(
-          dyn_carry['deter'], dyn_carry['stoch'], all_actions)
-      curiosity_state = self.curiosity_trigger.update(curiosity_state, mean_entropy)
-      explore, threshold = self.curiosity_trigger.should_explore(curiosity_state, mean_entropy)
-
-      curiosity_trigger = explore
-    else:
-      curiosity_trigger = False
-
-    act = jax.lax.cond(
-      curiosity_trigger,
-      lambda _: self.dyn.find_action_with_max_entropy(
-        dyn_carry['deter'], dyn_carry['stoch'], all_actions),
-      lambda _: sample_action(),
-      operand=None
-    )
-    # 好奇心机制结束
+    act, curiosity_state = self._compute_curiosity_action(
+        policy, dyn_carry, curiosity_state)
 
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
@@ -202,38 +155,47 @@ class Agent(embodied.jax.Agent):
       out.update(elements.tree.flatdict(dict(
         enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
-  
-  def curiosity_sample(self, prev_h, prev_z):
-    """
-    从动作空间中采样curiosity_samples个动作，根据每个动作对应的熵值大小构造一个数组，返回熵值最大的动作
-    """
-    actions = self.sample_uniform_actions()
-    action = self.dyn.find_action_with_max_entropy(prev_h, prev_z, actions)
-    return action
 
-  def sample_uniform_actions(self):
-    rng = jax.random.PRNGKey(0)
-    actions = []
+  def _compute_curiosity_action(self, policy, dyn_carry, curiosity_state):
+    """Compute action using curiosity-driven exploration if enabled.
 
-    for i in range(self.config.curiosity_samples):
-      subkey = jax.random.fold_in(rng, i)
-      act = {}
-      for name, space in self.act_space.items():
-        if space.discrete:
-          val = jax.random.randint(
-            subkey, shape=(self.config.batch_size,) + space.shape,
-            minval=space.low,
-            maxval=space.high
-          )
-        else:
-          val = jax.random.uniform(
-            subkey, shape=(self.config.batch_size,) + space.shape,
-            minval=space.low,
-            maxval=space.high
-          )
-        act[name] = val
-      actions.append(act)
-    return actions
+    Args:
+      policy: Policy distribution from which to sample actions
+      dyn_carry: Current RSSM dynamics state (contains deter, stoch)
+      curiosity_state: Current curiosity trigger state (mean, var)
+
+    Returns:
+      Tuple of (selected_action, updated_curiosity_state)
+    """
+    # Sample candidate actions from policy
+    sample_action = lambda: sample(policy)
+    all_actions = [sample_action() for _ in range(self.config.curiosity.samples)]
+
+    # Check if curiosity-driven exploration should be used
+    if self.config.curiosity.enabled and curiosity_state is not None:
+      # Compute mean uncertainty over all candidate actions
+      mean_entropy = self.dyn.mean_uncertainty_over_actions(
+          dyn_carry['deter'], dyn_carry['stoch'], all_actions)
+
+      # Update curiosity state and check if threshold exceeded
+      curiosity_state = self.curiosity_trigger.update(curiosity_state, mean_entropy)
+      explore, threshold = self.curiosity_trigger.should_explore(curiosity_state, mean_entropy)
+
+      # Select action based on curiosity trigger
+      curiosity_triggered = explore
+    else:
+      curiosity_triggered = False
+
+    # Choose action: max-entropy if exploring, policy sample otherwise
+    act = jax.lax.cond(
+      curiosity_triggered,
+      lambda _: self.dyn.find_action_with_max_entropy(
+        dyn_carry['deter'], dyn_carry['stoch'], all_actions),
+      lambda _: sample_action(),
+      operand=None
+    )
+
+    return act, curiosity_state
 
   def train(self, carry, data):
     carry, obs, prevact, stepid, curiosity_state = self._apply_replay_context(carry, data)
