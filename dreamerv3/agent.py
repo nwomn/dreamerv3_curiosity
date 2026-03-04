@@ -71,8 +71,23 @@ class Agent(embodied.jax.Agent):
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
-    self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    # FEP modules (only active when fep.enabled=True)
+    self.fep_enabled = config.fep.enabled
+    if self.fep_enabled:
+      scalar = elements.Space(np.float32, ())
+      self.info_gain = embodied.jax.MLPHead(
+          scalar, **config.info_gain_head, name='info_gain')
+      rssm_cfg = config.dyn[config.dyn.typ]
+      feat_dim = rssm_cfg.deter + rssm_cfg.stoch * rssm_cfg.classes
+      self.goal_imaginator = GoalImaginator(feat_dim, config)
+      self.goal_imaginator.init_variables()
+      self.fep_scheduler = FEPScheduler(config)
+      self.fep_scheduler.init_variables()
+
+    modules = [self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    if self.fep_enabled:
+      modules.append(self.info_gain)
+    self.modules = modules
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt') # 这里通过self.opt调用embodied.jax.Optimizer的__init__方法
@@ -80,6 +95,8 @@ class Agent(embodied.jax.Agent):
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    if not self.fep_enabled:
+      scales.pop('info_gain', None)
     self.scales = scales
 
   @property
@@ -185,6 +202,22 @@ class Agent(embodied.jax.Agent):
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
 
+    # FEP Phase 2: Train info_gain head and update FEP state
+    if self.fep_enabled:
+      # Train info_gain head to predict KL (dyn loss) from features
+      ig_inp = sg(self.feat2tensor(repfeat))  # [B, T, D], stop gradient
+      ig_target = sg(losses['dyn'])  # [B, T], stop gradient from KL
+      losses['info_gain'] = self.info_gain(ig_inp, 2).loss(ig_target)
+
+      # Update FEP scheduler with current batch KL
+      current_kl = sg(losses['dyn']).mean()
+      fep_alpha, fep_beta = self.fep_scheduler.update_and_get(
+          current_kl, training)
+
+      # Update goal imaginator with current features and rewards
+      self.goal_imaginator.update_goal(
+          sg(self.feat2tensor(repfeat)), obs['reward'])
+
     # Imagination
     K = min(self.config.imag_last or T, T)
     H = self.config.imag_length
@@ -200,9 +233,28 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+
+    # Compute reward with optional FEP augmentation
+    img_rew = self.rew(inp, 2).pred()
+    if self.fep_enabled:
+      # Info gain: predicted KL along imagined trajectory
+      img_info_gain = self.info_gain(sg(inp), 2).pred()
+      # Goal proximity: cosine similarity to goal state
+      img_goal_prox = self.goal_imaginator.proximity(sg(inp))
+      # Augmented reward = reward + alpha * info_gain + beta * goal_proximity
+      augmented_rew = img_rew + fep_alpha * img_info_gain + fep_beta * img_goal_prox
+      metrics['fep/alpha'] = fep_alpha
+      metrics['fep/beta'] = fep_beta
+      metrics['fep/avg_kl'] = self.fep_scheduler.avg_kl.read()
+      metrics['fep/img_info_gain'] = img_info_gain.mean()
+      metrics['fep/img_goal_prox'] = img_goal_prox.mean()
+      metrics['fep/reward_seen'] = self.goal_imaginator.reward_seen.read()
+    else:
+      augmented_rew = img_rew
+
     los, imgloss_out, mets = imag_loss(
         imgact,
-        self.rew(inp, 2).pred(),
+        augmented_rew,
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
@@ -488,3 +540,137 @@ def lambda_return(last, term, rew, val, boot, disc, lam):
   for t in reversed(range(live.shape[1])):
     rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
   return jnp.stack(list(reversed(rets))[:-1], 1)
+
+
+class GoalImaginator:
+  """Maintains a goal state via EMA of high-reward features.
+
+  Uses nj.Variable for persistent state (z_goal and reward_seen flag).
+  Not included in optimizer modules since it has no trainable parameters.
+  """
+
+  def __init__(self, feat_dim, config, name='goal_imaginator'):
+    self.feat_dim = feat_dim
+    self.ema_rate = config.fep.goal_ema_rate
+    self.topk = config.fep.goal_topk
+    self._name = name
+
+  def init_variables(self):
+    """Initialize persistent state variables. Call after nj context is set."""
+    self.z_goal = nj.Variable(
+        jnp.zeros, self.feat_dim, f32, name=f'{self._name}/z_goal')
+    self.reward_seen = nj.Variable(
+        jnp.zeros, (), f32, name=f'{self._name}/reward_seen')
+
+  def update_goal(self, feat, reward):
+    """Update goal state using top-k high-reward features.
+
+    Args:
+      feat: Feature tensor [B, T, D] (already stop-gradiented)
+      reward: Reward tensor [B, T]
+    """
+    B, T, D = feat.shape
+    flat_feat = feat.reshape(B * T, D)
+    flat_rew = reward.reshape(B * T)
+
+    # Select top-k high reward states
+    k = min(self.topk, B * T)
+    topk_idx = jnp.argsort(flat_rew)[-k:]
+    topk_feat = flat_feat[topk_idx]
+    topk_rew = flat_rew[topk_idx]
+
+    # Softmax-weighted average of top-k features
+    weights = jax.nn.softmax(topk_rew)
+    new_target = jnp.sum(topk_feat * weights[:, None], axis=0)
+
+    # EMA update z_goal
+    z_goal = self.z_goal.read()
+    z_goal = (1 - self.ema_rate) * z_goal + self.ema_rate * new_target
+    self.z_goal.write(z_goal)
+
+    # Track whether any non-zero reward has been seen
+    has_reward = (jnp.abs(flat_rew).max() > 1e-8).astype(f32)
+    self.reward_seen.write(jnp.maximum(self.reward_seen.read(), has_reward))
+
+  def get_goal(self):
+    """Return current goal state."""
+    return self.z_goal.read()
+
+  def proximity(self, feat):
+    """Compute cosine similarity between features and goal state.
+
+    Args:
+      feat: Feature tensor [..., D]
+
+    Returns:
+      Cosine similarity [...], range [-1, 1]
+    """
+    z_goal = self.z_goal.read()
+    # Cosine similarity
+    feat_norm = jnp.maximum(jnp.linalg.norm(feat, axis=-1, keepdims=True), 1e-8)
+    goal_norm = jnp.maximum(jnp.linalg.norm(z_goal, keepdims=True), 1e-8)
+    similarity = jnp.sum(feat * z_goal, axis=-1) / (
+        feat_norm[..., 0] * goal_norm[0])
+    # Mask out if reward never seen (cold start)
+    return similarity * self.reward_seen.read()
+
+
+class FEPScheduler:
+  """Dynamic alpha/beta scheduler based on average KL divergence.
+
+  alpha (exploration) increases when KL is high (model is uncertain).
+  beta (goal-directed) increases when KL is low (model is confident)
+  and training has progressed past warmup.
+
+  Uses nj.Variable for persistent state.
+  """
+
+  def __init__(self, config, name='fep_scheduler'):
+    self.alpha_max = config.fep.alpha_max
+    self.beta_max = config.fep.beta_max
+    self.beta_warmup = config.fep.beta_warmup
+    self.kl_threshold = config.fep.kl_threshold
+    self._name = name
+
+  def init_variables(self):
+    """Initialize persistent state variables. Call after nj context is set."""
+    self.avg_kl = nj.Variable(
+        jnp.zeros, (), f32, name=f'{self._name}/avg_kl')
+    self.step_count = nj.Variable(
+        jnp.zeros, (), f32, name=f'{self._name}/step_count')
+
+  def update_and_get(self, current_kl, training):
+    """Update KL stats and return current alpha, beta.
+
+    Args:
+      current_kl: Scalar, mean KL divergence of current batch
+      training: Whether in training mode
+
+    Returns:
+      (alpha, beta) tuple of scalars
+    """
+    avg_kl = self.avg_kl.read()
+    step_count = self.step_count.read()
+
+    # EMA update of average KL (only during training)
+    ema_rate = 0.01
+    new_avg_kl = jnp.where(
+        training,
+        (1 - ema_rate) * avg_kl + ema_rate * current_kl,
+        avg_kl)
+    new_step = jnp.where(training, step_count + 1, step_count)
+    self.avg_kl.write(new_avg_kl)
+    self.step_count.write(new_step)
+
+    # alpha = alpha_max * sigmoid(3 * (avg_kl - threshold))
+    # High KL -> high alpha (explore more)
+    alpha = self.alpha_max * jax.nn.sigmoid(
+        3.0 * (new_avg_kl - self.kl_threshold))
+
+    # beta = beta_max * warmup_factor * sigmoid(3 * (threshold - avg_kl))
+    # Low KL + enough training -> high beta (exploit goals)
+    warmup_factor = jnp.clip(new_step / self.beta_warmup, 0.0, 1.0)
+    beta = self.beta_max * warmup_factor * jax.nn.sigmoid(
+        3.0 * (self.kl_threshold - new_avg_kl))
+
+    return alpha, beta
