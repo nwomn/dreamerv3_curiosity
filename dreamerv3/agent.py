@@ -558,9 +558,9 @@ class GoalImaginator:
   def init_variables(self):
     """Initialize persistent state variables. Call after nj context is set."""
     self.z_goal = nj.Variable(
-        jnp.zeros, self.feat_dim, f32, name=f'{self._name}/z_goal')
+        jnp.zeros, self.feat_dim, f32, name=f'{self._name}_z_goal')
     self.reward_seen = nj.Variable(
-        jnp.zeros, (), f32, name=f'{self._name}/reward_seen')
+        jnp.zeros, (), f32, name=f'{self._name}_reward_seen')
 
   def update_goal(self, feat, reward):
     """Update goal state using top-k high-reward features.
@@ -635,9 +635,9 @@ class FEPScheduler:
   def init_variables(self):
     """Initialize persistent state variables. Call after nj context is set."""
     self.avg_kl = nj.Variable(
-        jnp.zeros, (), f32, name=f'{self._name}/avg_kl')
+        jnp.zeros, (), f32, name=f'{self._name}_avg_kl')
     self.step_count = nj.Variable(
-        jnp.zeros, (), f32, name=f'{self._name}/step_count')
+        jnp.zeros, (), f32, name=f'{self._name}_step_count')
 
   def update_and_get(self, current_kl, training):
     """Update KL stats and return current alpha, beta.
