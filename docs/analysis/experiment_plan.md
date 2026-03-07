@@ -639,9 +639,10 @@ CUDA_VISIBLE_DEVICES=2 python -u dreamerv3/main.py \
 
 #### 灵活调整原则
 
-1. **先跑FEP，再决定Baseline**
-   - 如果FEP效果不好，省下Baseline时间调整方向
-   - 如果FEP效果好，再跑Baseline对比
+1. **先跑Baseline建立基准** ⭐ 当前策略（2026-03-06更新）
+   - FEP有效性尚未验证，先建立baseline基准
+   - 有了baseline结果后，再决定是否继续投入FEP
+   - 避免在未验证的方法上过度投入资源
 
 2. **使用Atari 100k快速验证**
    - 100k步只需3.7小时，400k需14.8小时
@@ -659,14 +660,31 @@ CUDA_VISIBLE_DEVICES=2 python -u dreamerv3/main.py \
 
 ### 11.6 时间节点规划
 
-#### 1 GPU方案时间线
+#### 当前执行状态（2026-03-06更新）
+
+**策略调整**: 优先建立Baseline基准
+
+**进行中**:
+- 🔄 Crafter Baseline（原服务器GPU 1）
+- 🔄 Montezuma Baseline（新服务器GPU 3）
+
+**已完成**:
+- ✅ Crafter FEP
+
+**下一步计划**:
+1. 等待Crafter Baseline完成（约1.7天）
+2. 等待Montezuma Baseline完成（约0.62天）
+3. 根据baseline结果，决定是否继续FEP实验
+4. 如果继续，优先跑Atari-5 Baseline（Pitfall, Venture, PrivateEye, Solaris）
+
+#### 1 GPU方案时间线（原计划，已调整）
 
 **Week 1** (3/6-3/12):
 - Crafter Baseline完成
-- Atari-5 FEP开始（完成2-3个）
+- Atari-5 Baseline开始
 
 **Week 2** (3/13-3/19):
-- Atari-5 FEP完成
+- Atari-5 Baseline完成
 - Atari-5 Baseline开始
 
 **Week 3** (3/20-3/26):
