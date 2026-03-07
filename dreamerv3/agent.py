@@ -11,6 +11,7 @@ import numpy as np
 import optax
 
 from . import rssm
+from .goal_bank import GoalBank, GoalConditionedPolicy, SubgoalDecomposer
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -84,9 +85,20 @@ class Agent(embodied.jax.Agent):
       self.fep_scheduler = FEPScheduler(config)
       self.fep_scheduler.init_variables()
 
+      # Goal Bank for Level 2 Imagination
+      self.goal_bank = GoalBank(capacity=100)
+
+      # Goal-conditioned policy for Case 2
+      self.goal_cond_policy = GoalConditionedPolicy(config)
+
+      # Subgoal decomposer for Case 2
+      self.subgoal_decomposer = SubgoalDecomposer(
+          world_model=self.dyn, max_depth=3)
+
     modules = [self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     if self.fep_enabled:
       modules.append(self.info_gain)
+      modules.append(self.goal_cond_policy)
     self.modules = modules
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
@@ -97,6 +109,7 @@ class Agent(embodied.jax.Agent):
     scales.update({k: rec for k in dec_space})
     if not self.fep_enabled:
       scales.pop('info_gain', None)
+      scales.pop('goal_policy', None)
     self.scales = scales
 
   @property
@@ -204,9 +217,23 @@ class Agent(embodied.jax.Agent):
 
     # FEP Phase 2: Train info_gain head and update FEP state
     if self.fep_enabled:
-      # Train info_gain head to predict KL (dyn loss) from features
+      # Train info_gain head to predict CUMULATIVE KL over H steps
       ig_inp = sg(self.feat2tensor(repfeat))  # [B, T, D], stop gradient
-      ig_target = sg(losses['dyn'])  # [B, T], stop gradient from KL
+      dyn_loss = sg(losses['dyn'])  # [B, T], stop gradient from KL
+
+      # Compute cumulative KL target: sum of KL from t to t+H
+      H = self.config.imag_length
+      cumulative_kl = jnp.zeros_like(dyn_loss)
+      for h in range(H):
+        shifted = jnp.roll(dyn_loss, -h, axis=1)
+        # Mask out invalid positions (beyond sequence end)
+        mask = (jnp.arange(T)[None, :] + h < T).astype(f32)
+        cumulative_kl += shifted * mask
+
+      # Normalize to have mean=0, std=1 (so head learns relative values)
+      ig_target = (cumulative_kl - cumulative_kl.mean()) / (cumulative_kl.std() + 1e-8)
+      ig_target = sg(ig_target)
+
       losses['info_gain'] = self.info_gain(ig_inp, 2).loss(ig_target)
 
       # Update FEP scheduler with current batch KL
@@ -217,6 +244,70 @@ class Agent(embodied.jax.Agent):
       # Update goal imaginator with current features and rewards
       self.goal_imaginator.update_goal(
           sg(self.feat2tensor(repfeat)), obs['reward'])
+
+      # Train goal-conditioned policy (Case 2)
+      # Sample high-reward states from current batch to add to goal bank
+      B, T = obs['reward'].shape
+      flat_rew = obs['reward'].reshape(B * T)
+      flat_feat = jax.tree.map(lambda x: x.reshape(B * T, *x.shape[2:]), repfeat)
+
+      # Find top-k high reward states in current batch
+      topk = min(8, B * T)
+      topk_idx = jnp.argsort(flat_rew)[-topk:]
+      topk_rew = flat_rew[topk_idx]
+
+      # For states with reward > threshold, train goal-conditioned policy
+      # to predict actions that lead to these high-reward states
+      reward_threshold = 0.5
+      high_rew_mask = topk_rew > reward_threshold
+
+      if jnp.any(high_rew_mask):
+        # Get features of high-reward states (as goals)
+        goal_indices = topk_idx[high_rew_mask]
+        goal_feats = jax.tree.map(lambda x: x[goal_indices], flat_feat)
+
+        # For each goal, train policy to predict actions from earlier states
+        # Use states H steps before the goal as start states
+        H_lookback = 5
+        goal_policy_losses = []
+
+        for i, goal_idx in enumerate(goal_indices):
+          # Find start state (H steps before goal)
+          start_idx = jnp.maximum(goal_idx - H_lookback, 0)
+
+          # Get trajectory from start to goal
+          traj_indices = jnp.arange(start_idx, goal_idx)
+          if len(traj_indices) > 0:
+            traj_feats = jax.tree.map(lambda x: x[traj_indices], flat_feat)
+            traj_acts = jax.tree.map(
+                lambda x: x.reshape(B * T, *x.shape[2:])[traj_indices],
+                prevact)
+
+            # Goal feature (repeated for each step in trajectory)
+            goal_feat_repeated = jax.tree.map(
+                lambda x: jnp.repeat(x[i:i+1], len(traj_indices), axis=0),
+                goal_feats)
+
+            # Predict actions using goal-conditioned policy
+            state_feat_tensor = self.feat2tensor(traj_feats)
+            goal_feat_tensor = self.feat2tensor(goal_feat_repeated)
+            action_pred = self.goal_cond_policy(
+                sg(state_feat_tensor), sg(goal_feat_tensor))
+
+            # Compute loss (negative log likelihood of actual actions)
+            for act_key in self.act_space:
+              act_target = traj_acts[act_key]
+              loss = -action_pred[act_key].log_prob(act_target)
+              goal_policy_losses.append(loss.mean())
+
+        if goal_policy_losses:
+          losses['goal_policy'] = jnp.stack(goal_policy_losses).mean()
+        else:
+          # No valid trajectories, use zero loss
+          losses['goal_policy'] = jnp.zeros((), f32)
+      else:
+        # No high-reward states, use zero loss
+        losses['goal_policy'] = jnp.zeros((), f32)
 
     # Imagination
     K = min(self.config.imag_last or T, T)
@@ -245,7 +336,8 @@ class Agent(embodied.jax.Agent):
       augmented_rew = img_rew + fep_alpha * img_info_gain + fep_beta * img_goal_prox
       metrics['fep/alpha'] = fep_alpha
       metrics['fep/beta'] = fep_beta
-      metrics['fep/avg_kl'] = self.fep_scheduler.avg_kl.read()
+      metrics['fep/slow_kl'] = self.fep_scheduler.slow_kl.read()
+      metrics['fep/fast_kl'] = self.fep_scheduler.fast_kl.read()
       metrics['fep/img_info_gain'] = img_info_gain.mean()
       metrics['fep/img_goal_prox'] = img_goal_prox.mean()
       metrics['fep/reward_seen'] = self.goal_imaginator.reward_seen.read()
@@ -390,6 +482,118 @@ class Agent(embodied.jax.Agent):
         (carry, rhs(obs), rhs(prevact), rhs(stepid)),
         (rep_carry, rep_obs, rep_prevact, rep_stepid))
     return carry, obs, prevact, stepid
+
+  def find_similar_trajectories(self, goal_obs, replay_buffer, top_k=5):
+    """Find trajectories that reach states similar to goal_obs.
+
+    Uses hybrid search (Case 1):
+    - Stage 1: Latent space coarse filter (fast)
+    - Stage 2: Observation space precise matching (accurate, SSIM)
+
+    Alternative approaches (if performance is poor):
+    - Method B: Search/planning (beam search, MCTS)
+    - Method D: Attraction field (action selection bias)
+
+    Args:
+      goal_obs: Goal observation (e.g., [64, 64, 3])
+      replay_buffer: Replay buffer containing historical trajectories
+      top_k: Number of top similar trajectories to return
+
+    Returns:
+      List of (traj_id, timestep, similarity) tuples
+    """
+    # Stage 1: Latent space coarse filter
+    # Encode goal observation to latent
+    goal_tokens = self.enc.forward(goal_obs)
+    goal_z = self.dyn.encode_tokens(goal_tokens)
+
+    candidates = []
+    for traj_id, traj in enumerate(replay_buffer):
+      for t in range(len(traj)):
+        # Compute cosine distance in latent space
+        traj_z = traj['latent'][t]
+        dist = self._cosine_distance(traj_z, goal_z)
+        if dist < 0.3:  # Coarse threshold
+          candidates.append((traj_id, t, dist))
+
+    # Take top 100 candidates
+    candidates = sorted(candidates, key=lambda x: x[2])[:100]
+
+    # Stage 2: Observation space precise matching
+    try:
+      from skimage.metrics import structural_similarity as ssim
+    except ImportError:
+      # Fallback: use latent space distance only
+      return sorted(candidates, key=lambda x: x[2])[:top_k]
+
+    results = []
+    for traj_id, t, _ in candidates:
+      # Decode latent to observation
+      traj_latent = replay_buffer[traj_id]['latent'][t]
+      obs_pred = self.dec.forward(traj_latent)
+
+      # Compute SSIM
+      similarity = ssim(obs_pred, goal_obs, multichannel=True, channel_axis=-1)
+      if similarity > 0.7:  # Precise threshold
+        results.append((traj_id, t, similarity))
+
+    return sorted(results, key=lambda x: x[2], reverse=True)[:top_k]
+
+  def _cosine_distance(self, feat1, feat2):
+    """Compute cosine distance between two feature vectors."""
+    norm1 = jnp.linalg.norm(feat1) + 1e-8
+    norm2 = jnp.linalg.norm(feat2) + 1e-8
+    similarity = jnp.dot(feat1.flatten(), feat2.flatten()) / (norm1 * norm2)
+    return 1.0 - similarity
+
+  def imagine_to_goal(self, start_state, goal_obs):
+    """Imagine trajectory from start_state to goal_obs (Case 2).
+
+    Uses goal-conditioned policy and subgoal decomposition.
+
+    Args:
+      start_state: Current state (h, z)
+      goal_obs: Goal observation
+
+    Returns:
+      List of trajectory dicts with {state, action, next_state}
+    """
+    if not self.fep_enabled:
+      raise ValueError("FEP must be enabled to use imagine_to_goal")
+
+    # Encode goal observation to latent
+    goal_tokens = self.enc.forward(goal_obs)
+    goal_state = self.dyn.encode_tokens(goal_tokens)
+
+    # Decompose into subgoals
+    subgoals = self.subgoal_decomposer.decompose(start_state, goal_state)
+
+    # Imagine trajectory to each subgoal
+    trajectory = []
+    current_state = start_state
+
+    for subgoal in subgoals:
+      # Use goal-conditioned policy
+      for _ in range(15):  # H steps per subgoal
+        state_feat = self.feat2tensor(current_state)
+        goal_feat = self.feat2tensor(subgoal)
+
+        # Sample action from goal-conditioned policy
+        action_dist = self.goal_cond_policy(state_feat, goal_feat)
+        action = action_dist.sample(nj.seed())
+
+        # Step world model
+        next_state = self.dyn.step(current_state, action)
+
+        trajectory.append({
+            'state': current_state,
+            'action': action,
+            'next_state': next_state,
+        })
+
+        current_state = next_state
+
+    return trajectory
 
   def _make_opt(
       self,
@@ -616,11 +820,15 @@ class GoalImaginator:
 
 
 class FEPScheduler:
-  """Dynamic alpha/beta scheduler based on average KL divergence.
+  """Dynamic alpha/beta scheduler using dual EMA.
 
-  alpha (exploration) increases when KL is high (model is uncertain).
-  beta (goal-directed) increases when KL is low (model is confident)
-  and training has progressed past warmup.
+  Compares fast EMA (recent trend) vs slow EMA (long-term average):
+  - fast_kl > slow_kl → model uncertain → increase alpha (explore)
+  - fast_kl < slow_kl → model confident → increase beta (exploit)
+
+  Alternative approaches (if performance is poor):
+  - Method B: Search/planning (beam search, MCTS)
+  - Method D: Attraction field (action selection bias)
 
   Uses nj.Variable for persistent state.
   """
@@ -629,13 +837,16 @@ class FEPScheduler:
     self.alpha_max = config.fep.alpha_max
     self.beta_max = config.fep.beta_max
     self.beta_warmup = config.fep.beta_warmup
-    self.kl_threshold = config.fep.kl_threshold
+    self.slow_ema_rate = 0.01  # Stable baseline
+    self.fast_ema_rate = 0.1   # Responsive to changes
     self._name = name
 
   def init_variables(self):
     """Initialize persistent state variables. Call after nj context is set."""
-    self.avg_kl = nj.Variable(
-        jnp.zeros, (), f32, name=f'{self._name}_avg_kl')
+    self.slow_kl = nj.Variable(
+        jnp.zeros, (), f32, name=f'{self._name}_slow_kl')
+    self.fast_kl = nj.Variable(
+        jnp.zeros, (), f32, name=f'{self._name}_fast_kl')
     self.step_count = nj.Variable(
         jnp.zeros, (), f32, name=f'{self._name}_step_count')
 
@@ -649,28 +860,32 @@ class FEPScheduler:
     Returns:
       (alpha, beta) tuple of scalars
     """
-    avg_kl = self.avg_kl.read()
+    slow_kl = self.slow_kl.read()
+    fast_kl = self.fast_kl.read()
     step_count = self.step_count.read()
 
-    # EMA update of average KL (only during training)
-    ema_rate = 0.01
-    new_avg_kl = jnp.where(
+    # Update both EMAs (only during training)
+    new_slow_kl = jnp.where(
         training,
-        (1 - ema_rate) * avg_kl + ema_rate * current_kl,
-        avg_kl)
+        (1 - self.slow_ema_rate) * slow_kl + self.slow_ema_rate * current_kl,
+        slow_kl)
+    new_fast_kl = jnp.where(
+        training,
+        (1 - self.fast_ema_rate) * fast_kl + self.fast_ema_rate * current_kl,
+        fast_kl)
     new_step = jnp.where(training, step_count + 1, step_count)
-    self.avg_kl.write(new_avg_kl)
+
+    self.slow_kl.write(new_slow_kl)
+    self.fast_kl.write(new_fast_kl)
     self.step_count.write(new_step)
 
-    # alpha = alpha_max * sigmoid(3 * (avg_kl - threshold))
-    # High KL -> high alpha (explore more)
+    # Alpha: fast > slow → uncertain → explore
     alpha = self.alpha_max * jax.nn.sigmoid(
-        3.0 * (new_avg_kl - self.kl_threshold))
+        3.0 * (new_fast_kl - new_slow_kl))
 
-    # beta = beta_max * warmup_factor * sigmoid(3 * (threshold - avg_kl))
-    # Low KL + enough training -> high beta (exploit goals)
+    # Beta: fast < slow → confident → exploit
     warmup_factor = jnp.clip(new_step / self.beta_warmup, 0.0, 1.0)
     beta = self.beta_max * warmup_factor * jax.nn.sigmoid(
-        3.0 * (self.kl_threshold - new_avg_kl))
+        3.0 * (new_slow_kl - new_fast_kl))
 
     return alpha, beta
