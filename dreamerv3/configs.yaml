@@ -125,6 +125,9 @@ defaults:
       beta_warmup: 5000          # Steps before beta starts ramping up
       goal_ema_rate: 0.01        # EMA rate for goal state update
       goal_topk: 8               # Top-k high-reward states for goal computation
+      efe_weight: 0.1            # Expected Free Energy bonus weight (Phase 4)
+      subgoal_max_depth: 3       # Max recursion depth for subgoal decomposition (Phase 5)
+      subgoal_horizon: 15        # Planning horizon for reachability check (Phase 5)
 
     # Info gain prediction head (predicts KL from features)
     info_gain_head: {layers: 1, units: 1024, act: silu, norm: rms, output: symlog_mse, outscale: 0.0, winit: trunc_normal_in}

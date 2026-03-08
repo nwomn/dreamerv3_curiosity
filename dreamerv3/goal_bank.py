@@ -4,8 +4,8 @@ import random
 import jax
 import jax.numpy as jnp
 import ninjax as nj
-from tensorflow_probability.substrates import jax as tfp
-tfd = tfp.distributions
+import embodied.jax
+import embodied.jax.nets as nn
 
 
 class GoalBank:
@@ -100,8 +100,16 @@ class GoalConditionedPolicy(nj.Module):
   - Method D: Attraction field (action selection bias)
   """
 
-  def __init__(self, config):
+  def __init__(self, act_space, config):
+    self.act_space = act_space
     self.config = config
+    # Use same distribution types as main policy
+    d1, d2 = config.policy_dist_disc, config.policy_dist_cont
+    outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
+    # Create MLP head for goal-conditioned policy
+    # Input will be concatenated [state_feat, goal_feat]
+    self.head = embodied.jax.MLPHead(
+        act_space, outs, **config.policy, name='goal_pol')
 
   def __call__(self, state_feat, goal_feat):
     """
@@ -110,21 +118,12 @@ class GoalConditionedPolicy(nj.Module):
       goal_feat: [..., D] goal state features
 
     Returns:
-      action_dist: Action distribution
+      action_dist: Dict of action distributions
     """
     # Concatenate state and goal features
     combined = jnp.concatenate([state_feat, goal_feat], axis=-1)
-
-    # Policy network
-    x = combined
-    for _ in range(self.config.depth):
-      x = nj.Linear(self.config.units)(x)
-      x = nj.LayerNorm()(x)
-      x = nj.SiLU()(x)
-
-    # Output action logits
-    logits = nj.Linear(self.config.act_dim)(x)
-    return tfd.Categorical(logits=logits)
+    # Get action distribution from MLP head
+    return self.head(combined, bdims=state_feat.ndim - 1)
 
 
 class SubgoalDecomposer:
