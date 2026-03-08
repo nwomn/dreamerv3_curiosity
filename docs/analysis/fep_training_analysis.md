@@ -1,9 +1,9 @@
 # FEP-Unified Dreamer 训练分析报告
 
-**日期**: 2026-03-05
+**日期**: 2026-03-08 (更新)
 **实验**: Crafter 环境 + FEP 模块
-**训练进度**: 284,110 / 1,100,000 步 (25.8%)
-**训练时长**: ~4 小时
+**训练进度**: 1,100,000 / 1,100,000 步 (100% 完成)
+**评估状态**: FEP + Baseline 均已完成 eval_only 评估
 
 ---
 
@@ -67,13 +67,17 @@ augmented_rew = raw_rew + α × info_gain + β × goal_proximity
 
 ### 2.2 与基准的对比
 
-**Crafter 环境基准得分**：
+**Crafter 环境基准得分（文献值）**：
 - 人类表现: ~50%
 - DreamerV3 + Curious Replay (SOTA): 19.4 ± 1.6%
-- **DreamerV3 baseline**: 14.5 ± 1.6%
+- **DreamerV3 baseline (文献)**: 14.5 ± 1.6%
 - DreamerV2: 10.0-11.7%
 
-**当前进度**：训练仅完成 25.8%，episode 得分已达到 3.49（约 5-7% 范围）。预计完整训练后有望接近或超过 baseline。
+**我们的实验结果（eval_only, 100k steps）**：
+- **DreamerV3 Baseline**: 12.46 ± 2.84（408 episodes）
+- **DreamerV3 + FEP**: 8.73 ± 2.13（421 episodes）
+
+Baseline 表现接近文献值（12.46 vs 14.5），FEP 显著低于 Baseline。
 
 ---
 
@@ -187,11 +191,11 @@ z_goal 是一个 **10,240 维的高维特征向量**，表示：
 
 ## 5. 关键结论
 
-### 5.1 FEP 模块有效性
+### 5.1 FEP 模块有效性（训练中期观察）
 
-✅ **Goal Proximity 显著有效**：
+✅ **Goal Proximity 显著有效（训练中期）**：
 - 贡献 32% 的增强奖励
-- 带来 140% 的性能提升
+- 带来 140% 的性能提升（相比自身早期阶段）
 - 与原始奖励独立（相关性 -0.076）
 
 ❌ **Info Gain 已退场**：
@@ -216,33 +220,136 @@ z_goal 是一个 **10,240 维的高维特征向量**，表示：
 
 ### 5.4 与 DreamerV3 的关系
 
-**协同增益，而非竞争**：
+**协同增益，而非竞争（训练中期观察）**：
 - 原始 DreamerV3: 68% 驱动力
 - FEP Goal Proximity: 32% 额外增益
-- 总效果: 1 + 1 > 2（140% 性能提升）
+- 训练中期效果: 1 + 1 > 2（140% 性能提升相比自身早期）
 
 ---
 
-## 6. 后续工作
+## 6. Crafter 最终评估对比 (2026-03-08)
 
-### 6.1 待完成
+### 6.1 评估配置
 
-- [ ] 完成完整训练（1.1M 步）
-- [ ] 最终性能评估
-- [ ] 与 DreamerV3 baseline 的消融对比
+两组实验均使用 `eval_only` 模式，加载 1.1M 步训练后的 checkpoint，在 Crafter 环境中运行 100k 步纯评估（无训练），各约 400 episodes。
 
-### 6.2 进一步分析
+| 配置 | Baseline | FEP |
+|------|----------|-----|
+| 训练步数 | 1,100,000 | 1,100,000 |
+| 评估步数 | 100,000 | 100,000 |
+| 评估 episodes | 408 | 421 |
+| FEP enabled | False | True |
 
-- [ ] z_goal 在不同训练阶段的演化
-- [ ] 特定维度与 Crafter 机制的对应关系
-- [ ] 想象轨迹如何逐步接近 z_goal
-- [ ] 不同环境（Atari, DMC）上的泛化性
+### 6.2 Episode Score 对比
 
-### 6.3 论文撰写
+| 指标 | Baseline | FEP | 差异 |
+|------|----------|-----|------|
+| Mean | **12.46** | 8.73 | +3.73 (+42.7%) |
+| Median | **13.1** | 9.1 | +4.0 |
+| Std | 2.84 | 2.13 | |
+| Max | **17.1** | 13.1 | +4.0 |
+| Min | -0.9 | -0.9 | |
+
+**统计检验**：
+- Welch t-test: t = 21.381, p = 4.37e-81
+- Cohen's d = 1.484（大效应量）
+- **结论: Baseline 显著优于 FEP**
+
+### 6.3 成就详情对比
+
+每个成就的 avg 值表示每 episode 平均获得该成就的次数。
+
+**[Basic Survival]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| collect_wood | 7.517 | 6.189 | Baseline |
+| collect_drink | 1.379 | 1.444 | FEP |
+| collect_sapling | 1.347 | 1.266 | Baseline |
+| wake_up | 0.763 | 1.190 | FEP |
+
+**[Crafting]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| place_table | 1.597 | 1.925 | FEP |
+| make_wood_pickaxe | 0.762 | 0.964 | FEP |
+| make_wood_sword | 0.684 | 0.698 | FEP |
+
+**[Mining]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| collect_stone | 5.706 | 2.831 | Baseline |
+| collect_coal | 0.428 | 0.257 | Baseline |
+| collect_iron | 0.074 | 0.000 | Baseline |
+| collect_diamond | 0.000 | 0.000 | Tie |
+
+**[Advanced Crafting]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| place_furnace | 0.618 | 0.194 | Baseline |
+| make_stone_pickaxe | 0.449 | 0.000 | Baseline |
+| make_stone_sword | 0.444 | 0.000 | Baseline |
+| make_iron_pickaxe | 0.000 | 0.000 | Tie |
+| make_iron_sword | 0.000 | 0.000 | Tie |
+
+**[Building]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| place_stone | 0.717 | 0.915 | FEP |
+| place_plant | 1.017 | 1.205 | FEP |
+
+**[Combat & Food]**
+
+| 成就 | Baseline | FEP | 胜者 |
+|------|----------|-----|------|
+| defeat_zombie | 0.260 | 0.156 | Baseline |
+| defeat_skeleton | 0.063 | 0.040 | Baseline |
+| eat_cow | 0.301 | 0.027 | Baseline |
+| eat_plant | 0.000 | 0.000 | Tie |
+
+**总计: Baseline 胜 11 项 | FEP 胜 7 项 | 平 4 项**
+
+### 6.4 结果分析
+
+**Baseline 优势领域**：Mining 和 Advanced Crafting。Baseline 能稳定推进技术树，从木器→石器→熔炉→铁矿，形成连贯的技能链。这些深层探索是 Crafter 高分的关键。
+
+**FEP 优势领域**：Basic Survival 和 Building/Crafting 基础操作。FEP 更频繁地 wake_up、place_table、制作基础工具，但无法进一步推进到高级工具和采矿。
+
+**核心问题**：FEP 的 Goal Proximity 机制可能产生了 **"浅层探索陷阱"**：
+1. 目标状态 z_goal 从高 reward 状态提取，但 Crafter 的 reward 在基础操作上也能获得
+2. FEP 引导 agent 反复执行容易获得 reward 的基础操作（place_table, make_wood_pickaxe），而非推进技术树
+3. 缺乏对 **技术树层级结构** 的理解，无法学会"先制作石镐才能挖煤/铁"的长程依赖
+
+**与训练中期观察的关系**：训练中期（25.8%）的 140% 提升是 FEP 相对自身早期的改善，并非与 Baseline 的对比。完成全部训练后，FEP 反而不如 Baseline，说明 Goal Proximity 在训练后期可能干扰了策略优化。
+
+---
+
+## 7. 后续工作
+
+### 7.1 已完成
+
+- [x] 完成完整训练（FEP + Baseline 各 1.1M 步）
+- [x] 最终性能评估（eval_only, 100k steps）
+- [x] 与 DreamerV3 baseline 的消融对比
+
+### 7.2 待完成
+
+- [ ] 分析 FEP 在 Crafter 上失效的根因（z_goal 收敛方向？beta 调度？）
+- [ ] 调整 FEP 超参数重新实验（降低 beta_max？增加 goal_topk？）
+- [ ] z_goal 在不同训练阶段的演化对比
+- [ ] 在其他环境（Atari, DMC）上测试 FEP 效果
+- [ ] 设计层级化目标机制以适应技术树结构
+
+### 7.3 论文撰写
 
 - [ ] 方法论部分：FEP 模块设计
-- [ ] 实验部分：训练动态分析
-- [ ] 结果部分：性能对比和消融实验
+- [ ] 实验部分：训练动态分析 + 最终评估对比
+- [ ] 结果部分：Crafter 成就细粒度分析
+- [ ] 讨论部分：FEP 在技术树环境中的局限性分析
 - [ ] 可视化：本文档中的所有图表
 
 ---
@@ -276,6 +383,6 @@ fep:
 
 ---
 
-**文档版本**: v1.0
-**最后更新**: 2026-03-05
+**文档版本**: v2.0
+**最后更新**: 2026-03-08
 

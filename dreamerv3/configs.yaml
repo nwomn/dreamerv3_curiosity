@@ -123,6 +123,7 @@ defaults:
       alpha_max: 0.1             # Max exploration bonus weight
       beta_max: 0.05             # Max goal-directed bonus weight
       beta_warmup: 5000          # Steps before beta starts ramping up
+      scheduler_ema_rate: 0.01   # EMA rate for prior entropy statistics in scheduler
       goal_ema_rate: 0.01        # EMA rate for goal state update
       goal_topk: 8               # Top-k high-reward states for goal computation
       efe_weight: 0.1            # Expected Free Energy bonus weight (Phase 4)

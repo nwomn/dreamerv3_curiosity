@@ -142,7 +142,10 @@ class GoalConditionedPolicy(nj.Module):
   def __init__(self, act_space, config, name='goal_cond_policy'):
     self.act_space = act_space
     self.config = config
-    self._name = name
+    d1, d2 = config.policy_dist_disc, config.policy_dist_cont
+    outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
+    self.head = embodied.jax.MLPHead(
+        act_space, outs, **config.policy, name='head')
 
   def __call__(self, state_feat, goal_feat):
     """Compute action distribution given state and goal.
@@ -154,23 +157,8 @@ class GoalConditionedPolicy(nj.Module):
     Returns:
       Action distribution dict
     """
-    # Concatenate state and goal features
     combined = jnp.concatenate([state_feat, goal_feat], axis=-1)
-
-    # MLP layers (same architecture as main policy)
-    x = combined
-    for i in range(self.config.policy.layers):
-      x = self.get(f'h{i}', nn.Linear, x.shape[-1],
-                   self.config.policy.units, act='silu')(x)
-
-    # Output action distribution
-    # Use same distribution types as main policy
-    d1, d2 = self.config.policy_dist_disc, self.config.policy_dist_cont
-    outs = {k: d1 if v.discrete else d2 for k, v in self.act_space.items()}
-
-    return self.get('dist', embodied.jax.MLPHead,
-                    self.act_space, outs, **self.config.policy,
-                    name='goal_pol')(x, bdims=state_feat.ndim - 1)
+    return self.head(combined, bdims=state_feat.ndim - 1)
 
 
 class ExpectedFreeEnergy(nj.Module):
