@@ -67,12 +67,21 @@ class Agent(embodied.jax.Agent):
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
+    # FEP: Info gain head
+    self.info_gain = embodied.jax.MLPHead(
+        scalar, 'mse', **config.info_gain_head, name='info_gain')
+
+    # FEP: Performance gate (hierarchical constraint)
+    self.perf_ema = nj.Variable(jnp.zeros, (), f32, name='perf_ema')
+    self.perf_peak = nj.Variable(jnp.zeros, (), f32, name='perf_peak')
+
     self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val,
+        self.info_gain]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt') # 这里通过self.opt调用embodied.jax.Optimizer的__init__方法
@@ -181,6 +190,24 @@ class Agent(embodied.jax.Agent):
       target = f32(value) / 255 if isimage(space) else value
       losses[key] = recon.loss(sg(target))
 
+    # FEP: Train info_gain_head
+    ig_inp = self.feat2tensor(repfeat)  # [B, T, feat_dim], 不 sg
+    H_ig = self.config.imag_length
+    dyn_loss = losses['dyn']  # KL(posterior || prior) [B, T]
+
+    # Cumulative KL over H steps
+    cumulative_kl = jnp.zeros_like(dyn_loss)
+    for h in range(H_ig):
+      shifted = jnp.roll(dyn_loss, -h, axis=1)
+      mask = (jnp.arange(T)[None, :] + h < T).astype(f32)
+      cumulative_kl += shifted * mask
+
+    # Z-score normalization
+    ig_target = (cumulative_kl - cumulative_kl.mean()) / (cumulative_kl.std() + 1e-8)
+
+    # Training loss
+    losses['info_gain'] = self.info_gain(ig_inp, 2).loss(ig_target)
+
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
@@ -193,16 +220,63 @@ class Agent(embodied.jax.Agent):
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
-    imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
+    # FEP: 移除 sg，让梯度流动
+    imgfeat = concat([first, imgfeat], 1)
     lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat))
     lastact = jax.tree.map(lambda x: x[:, None], lastact)
     imgact = concat([imgprevact, lastact], 1)
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+
+    # FEP: 计算 EFE
+    # Info gain（标准化到 [-1, 1]）
+    img_info_gain = self.info_gain(inp, 2).pred()  # z-score 范围 [-2, 2]
+    info_gain_norm = jnp.clip(img_info_gain / 2.0, -1.0, 1.0)
+
+    # EFE bonus（正号，鼓励高 info_gain）
+    beta = self.config.fep.beta
+
+    # Augmented reward（约束到 [0, 1]）
+    img_rew = self.rew(sg(inp), 2).pred()  # reward head 保持 sg
+
+    # FEP: Performance gate (hierarchical constraint)
+    # Track imagined extrinsic reward performance via EMA
+    rew_mean = sg(img_rew).mean()
+    rate = self.config.fep.perf_ema_rate
+    new_ema = (1 - rate) * self.perf_ema.read() + rate * rew_mean
+    new_peak = jnp.maximum(self.perf_peak.read(), new_ema)
+    if training:
+      self.perf_ema.write(new_ema)
+      self.perf_peak.write(new_peak)
+
+    # Gate: suppress exploration when performance drops from peak
+    # perf_drop >= 0, larger means worse performance regression
+    perf_drop = jnp.maximum(new_peak - new_ema, 0.0)
+    gate_scale = self.config.fep.gate_scale
+    perf_gate = jnp.exp(-gate_scale * perf_drop)  # [0, 1]
+
+    effective_beta = beta * perf_gate
+    efe_bonus = effective_beta * info_gain_norm
+
+    augmented_rew = img_rew + efe_bonus
+    augmented_rew = jnp.clip(augmented_rew, 0.0, 1.0)
+
+    # FEP: Metrics
+    metrics['fep/img_info_gain_raw'] = img_info_gain.mean()
+    metrics['fep/info_gain_norm'] = info_gain_norm.mean()
+    metrics['fep/efe_bonus'] = efe_bonus.mean()
+    metrics['fep/augmented_rew'] = augmented_rew.mean()
+    metrics['fep/original_rew'] = img_rew.mean()
+    metrics['fep/beta'] = beta
+    metrics['fep/perf_ema'] = new_ema
+    metrics['fep/perf_peak'] = new_peak
+    metrics['fep/perf_gate'] = perf_gate
+    metrics['fep/effective_beta'] = effective_beta
+
     los, imgloss_out, mets = imag_loss(
         imgact,
-        self.rew(inp, 2).pred(),
+        augmented_rew,  # 使用 augmented_rew
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
