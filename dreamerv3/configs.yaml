@@ -102,7 +102,7 @@ defaults:
     value: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     policy_dist_disc: categorical
     policy_dist_cont: bounded_normal
-    fep: {beta: 0.05, gate_scale: 100.0, perf_ema_rate: 0.01}
+    fep: {beta: 0.05, gate_scale: 100.0, perf_ema_rate: 0.01, peak_decay: 0.005}
     imag_last: 0
     imag_length: 15
     horizon: 333

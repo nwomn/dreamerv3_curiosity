@@ -241,11 +241,14 @@ class Agent(embodied.jax.Agent):
     img_rew = self.rew(sg(inp), 2).pred()  # reward head 保持 sg
 
     # FEP: Performance gate (hierarchical constraint)
-    # Track imagined extrinsic reward performance via EMA
-    rew_mean = sg(img_rew).mean()
+    # Track real environment reward (from replay buffer) via EMA
+    real_rew_mean = sg(obs['reward']).mean()
     rate = self.config.fep.perf_ema_rate
-    new_ema = (1 - rate) * self.perf_ema.read() + rate * rew_mean
-    new_peak = jnp.maximum(self.perf_peak.read(), new_ema)
+    new_ema = (1 - rate) * self.perf_ema.read() + rate * real_rew_mean
+    # Peak with decay: slowly converge toward ema, preventing permanent lock
+    peak_decay = self.config.fep.peak_decay
+    decayed_peak = (1 - peak_decay) * self.perf_peak.read() + peak_decay * new_ema
+    new_peak = jnp.maximum(decayed_peak, new_ema)
     if training:
       self.perf_ema.write(new_ema)
       self.perf_peak.write(new_peak)
